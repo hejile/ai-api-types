@@ -46,6 +46,11 @@ impl Request {
     pub fn builder(model: Model) -> RequestBuilder {
         RequestBuilder::new(model)
     }
+
+    pub fn add_message(&mut self, message: impl Into<ChatMessage>) -> &mut Self {
+        self.messages.push(message.into());
+        self
+    }
 }
 
 pub struct RequestBuilder {
@@ -89,14 +94,8 @@ impl RequestBuilder {
         }
     }
 
-    pub fn add_message(mut self, message: ChatMessage) -> Self {
-        self.messages.push(message);
-        self
-    }
-
-    /// A list of messages comprising the conversation so far.
-    pub fn messages(mut self, messages: Vec<ChatMessage>) -> Self {
-        self.messages = messages;
+    pub fn add_message(mut self, message: impl Into<ChatMessage>) -> Self {
+        self.messages.push(message.into());
         self
     }
 
@@ -252,20 +251,7 @@ pub enum ChatMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
-    Assistant {
-        content: String,
-        /// An optional name for the participant. Provides the model information to differentiate between participants of the same role.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        name: Option<String>,
-        /// (Beta) Set this to true to force the model to start its answer by the content of the supplied prefix in this assistant message.
-        /// You must set base_url="https://api.deepseek.com/beta" to use this feature.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        prefix: Option<bool>,
-        /// (Beta) Used for the thinking mode in the Chat [Prefix Completion feature](https://api-docs.deepseek.com/guides/chat_prefix_completion) as the input for the CoT in the last assistant message.
-        /// When using this feature, the prefix parameter must be set to true.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        reasoning_content: Option<String>,
-    },
+    Assistant(ResponseMessage),
     Tool {
         content: String,
         /// Tool call that this message is responding to.
@@ -275,26 +261,84 @@ pub enum ChatMessage {
 
 impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
-        Self::System {
+        ChatMessage::System {
             content: content.into(),
             name: None,
         }
     }
 
     pub fn user(content: impl Into<String>) -> Self {
-        Self::User {
+        ChatMessage::User {
             content: content.into(),
             name: None,
         }
     }
 
     pub fn assistant(content: impl Into<String>) -> Self {
-        Self::Assistant {
-            content: content.into(),
-            name: None,
-            prefix: None,
+        ChatMessage::Assistant(ResponseMessage {
+            content: Some(content.into()),
             reasoning_content: None,
+            tool_calls: Vec::new(),
+            role: "assistant".to_string(),
+            logprobs: None,
+        })
+    }
+}
+
+impl Into<ChatMessage> for String {
+    fn into(self) -> ChatMessage {
+        ChatMessage::User {
+            content: self,
+            name: None,
         }
+    }
+}
+
+impl Into<ChatMessage> for &str {
+    fn into(self) -> ChatMessage {
+        ChatMessage::User {
+            content: self.to_string(),
+            name: None,
+        }
+    }
+}
+
+impl Into<ChatMessage> for ResponseMessage {
+    fn into(mut self) -> ChatMessage {
+        // remove unnecessary fields for the next turn of conversation
+        self.logprobs = None;
+        ChatMessage::Assistant(self)
+    }
+}
+
+impl Into<ChatMessage> for &ResponseMessage {
+    fn into(self) -> ChatMessage {
+        let message = self.clone();
+        message.into()
+    }
+}
+
+impl Into<ChatMessage> for Choice {
+    fn into(self) -> ChatMessage {
+        self.message.into()
+    }
+}
+
+impl Into<ChatMessage> for &Choice {
+    fn into(self) -> ChatMessage {
+        self.message.clone().into()
+    }
+}
+
+impl Into<ChatMessage> for ChatCompletion {
+    fn into(self) -> ChatMessage {
+        self.assert_one_choice().into()
+    }
+}
+
+impl Into<ChatMessage> for &ChatCompletion {
+    fn into(self) -> ChatMessage {
+        self.assert_one_choice().into()
     }
 }
 
@@ -335,13 +379,87 @@ pub struct StreamOptions {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Tool {
     Function {
-        description: String,
-        name: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        parameters: Option<serde_json::Value>,
-        // default false. beta feature
-        #[serde(skip_serializing_if = "Option::is_none")]
-        strict: Option<bool>,
+        function: ToolFunctionDefinition,
+    }
+}
+
+impl Tool {
+    /// The name of the function to be called must be a-z, A-Z, 0-9, or contain underscores and dashes, with a maximum length of 64.
+    pub fn function_builder(name: impl Into<String>) -> ToolFunctionBuilder {
+        ToolFunctionBuilder {
+            name: name.into(),
+            description: None,
+            parameters: None,
+            strict: None,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ToolFunctionDefinition {
+    /// A description of what the function does, used by the model to choose when and how to call the function.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The name of the function to be called.
+    /// Must be a-z, A-Z, 0-9, or contain underscores and dashes, with a maximum length of 64.
+    pub name: String,
+    /// The parameters the functions accepts, described as a JSON Schema object.
+    /// See the [Tool Calls Guide](https://api-docs.deepseek.com/guides/tool_calls) for examples,
+    /// and the [JSON Schema reference](https://json-schema.org/understanding-json-schema/) for documentation about the format.
+    ///
+    /// Omitting parameters defines a function with an empty parameter list.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<serde_json::Value>,
+    /// If set to true, the API will use strict-mode for the tool calls to ensure the output always complies with the function's JSON schema.
+    /// This is a Beta feature, for more details please refer to [Tool Calls Guide](https://api-docs.deepseek.com/guides/tool_calls)
+    /// 
+    /// Default value: false
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
+}
+
+pub struct ToolFunctionBuilder {
+    name: String,
+    description: Option<String>,
+    parameters: Option<serde_json::Value>,
+    strict: Option<bool>,
+}
+
+impl ToolFunctionBuilder {
+    /// A description of what the function does, used by the model to choose when and how to call the function.
+    pub fn description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// The parameters the functions accepts, described as a JSON Schema object.
+    /// See the [Tool Calls Guide](https://api-docs.deepseek.com/guides/tool_calls) for examples,
+    /// and the [JSON Schema reference](https://json-schema.org/understanding-json-schema/) for documentation about the format.
+    ///
+    /// Omitting parameters defines a function with an empty parameter list.
+    pub fn parameters(mut self, parameters: serde_json::Value) -> Self {
+        self.parameters = Some(parameters);
+        self
+    }
+
+    /// If set to true, the API will use strict-mode for the tool calls to ensure the output always complies with the function's JSON schema.
+    /// This is a Beta feature, for more details please refer to [Tool Calls Guide](https://api-docs.deepseek.com/guides/tool_calls)
+    /// 
+    /// Default value: false
+    pub fn strict(mut self, strict: bool) -> Self {
+        self.strict = Some(strict);
+        self
+    }
+
+    pub fn build(self) -> Tool {
+        Tool::Function {
+            function: ToolFunctionDefinition {
+                name: self.name,
+                description: self.description,
+                parameters: self.parameters,
+                strict: self.strict,
+            },
+        }
     }
 }
 
@@ -350,6 +468,16 @@ pub enum Tool {
 pub enum ToolChoice {
     General(GeneralToolChoice),
     Named(NamedToolChoice),
+}
+
+impl ToolChoice {
+    pub fn named_function(function_name: impl Into<String>) -> Self {
+        ToolChoice::Named(NamedToolChoice::Function {
+            function: NamedToolChoiceFunction {
+                name: function_name.into(),
+            },
+        })
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -364,11 +492,17 @@ pub enum GeneralToolChoice {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum NamedToolChoice {
     Function {
-        name: String,
+        function: NamedToolChoiceFunction,
     },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct NamedToolChoiceFunction {
+    /// The name of the function to call.
+    name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ChatCompletion {
     /// A unique identifier for the chat completion.
     pub id: String,
@@ -386,7 +520,14 @@ pub struct ChatCompletion {
     pub usage: Usage,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+impl ChatCompletion {
+    pub fn assert_one_choice(&self) -> &Choice {
+        assert_eq!(self.choices.len(), 1, "Expected exactly one choice, got {}", self.choices.len());
+        &self.choices[0]
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Choice {
     /// The reason the model stopped generating tokens.
     /// This will be stop if the model hit a natural stop point or a provided stop sequence,
@@ -401,7 +542,7 @@ pub struct Choice {
     pub message: ResponseMessage,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
 pub enum FinishReason {
     Stop,
@@ -413,44 +554,27 @@ pub enum FinishReason {
     Other,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ResponseMessage {
     /// The contents of the message.
     pub content: Option<String>,
     /// For thinking mode only.
     /// The reasoning contents of the assistant message, before the final answer.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
     /// The tool calls generated by the model.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_calls: Option<Vec<ResponseToolCall>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ResponseToolCall>,
     /// Possible values: [assistant]
     /// The role of the author of this message.
+    #[serde(skip_serializing)]
     pub role: String,
     /// Log probability information for the choice.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<LogProbs>,
 }
 
-impl ResponseMessage {
-    pub fn to_chat_message(&self) -> ChatMessage {
-        let content = match self.content {
-            Some(ref c) => {
-                if c.is_empty() {
-                    panic!("ResponseMessage content is empty");
-                }
-                c.clone()
-            },
-            None => panic!("ResponseMessage content is None"),
-        };
-        ChatMessage::Assistant {
-            content,
-            name: None,
-            prefix: None,
-            reasoning_content: None,
-        }
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseToolCall {
     Function {
@@ -461,25 +585,45 @@ pub enum ResponseToolCall {
     },
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ResponseToolCallFunction {
     /// The name of the function to call.
     pub name: String,
     /// The arguments to call the function with, as generated by the model in JSON format.
     /// Note that the model does not always generate valid JSON, and may hallucinate parameters not defined by your function schema.
     /// Validate the arguments in your code before calling your function.
+    #[serde(deserialize_with = "from_json_string", serialize_with = "to_json_string")]
     pub arguments: serde_json::Value,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+fn from_json_string<'de, D>(deserializer: D) -> Result<serde_json::Value, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // 先解析为 String
+    let s: String = serde::Deserialize::deserialize(deserializer)?;
+    // 再将 String 解析为 Value
+    serde_json::from_str(&s).map_err(serde::de::Error::custom)
+}
+
+fn to_json_string<S>(value: &serde_json::Value, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let s = serde_json::to_string(value).map_err(serde::ser::Error::custom)?;
+    serializer.serialize_str(&s)
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct LogProbs {
     /// A list of message content tokens with log probability information.
     pub content: Option<PredictedTokenLogProb>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     /// A list of message content tokens with log probability information.
     pub reasoning_content: Option<PredictedTokenLogProb>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PredictedTokenLogProb {
     /// The token.
     pub token: String,
@@ -495,7 +639,7 @@ pub struct PredictedTokenLogProb {
     pub top_logprobs: Vec<LogProb>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct LogProb {
     /// The token.
     pub token: String,
@@ -508,7 +652,7 @@ pub struct LogProb {
     pub bytes: Option<Vec<u8>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Usage {
     /// Number of tokens in the generated completion.
     pub completion_tokens: u32,
@@ -525,13 +669,13 @@ pub struct Usage {
     pub completion_tokens_details: Option<CompletionTokensDetails>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CompletionTokensDetails {
     /// Tokens generated by the model for reasoning.
     pub reasoning_tokens: u32,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ChatCompletionChunk {
     pub id: String,
     pub choices: Vec<ChunkChoice>,
@@ -542,15 +686,16 @@ pub struct ChatCompletionChunk {
     pub usage: Option<Usage>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ChunkChoice {
     pub delta: ChunkChoiceDelta,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<LogProbs>,
     pub finish_reason: Option<FinishReason>,
     pub index: u32,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ChunkChoiceDelta {
     pub content: Option<String>,
     pub reasoning_content: Option<String>,
@@ -585,6 +730,9 @@ mod tests {
             .await
             .expect("Failed to send request");
         assert!(response.status().is_success(), "Response status: {}", response.status());
+        // let raw_response = response.text().await.expect("Failed to read response text");
+        // dbg!("Raw response: {}", &raw_response);
+        // serde_json::from_str(&raw_response).expect("Failed to parse response")
         response.json().await.expect("Failed to parse response")
     }
 
@@ -636,19 +784,16 @@ mod tests {
         let client = reqwest::Client::new();
 
         let request = Request::builder(Model::V4Flash)
-            .add_message(ChatMessage::user("Hello"))
+            .add_message("Hello")
             .thinking(Thinking::Disabled)
             .max_tokens(50)
             .stream(false)
             .build();
 
-        dbg!("Request: {:?}", serde_json::to_string(&request).unwrap());
-
         let completion = send_request(&client, &request).await;
 
         println!("Response: {:?}", completion);
-        assert!(!completion.choices.is_empty());
-        assert!(!completion.choices[0].message.content.as_ref().unwrap().is_empty());
+        assert!(!completion.assert_one_choice().message.content.as_ref().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -656,29 +801,25 @@ mod tests {
         let client = reqwest::Client::new();
 
         let mut request = Request::builder(Model::V4Flash)
-            .add_message(ChatMessage::user("Hello"))
+            .add_message("Hello")
             .add_message(ChatMessage::assistant("Hi! How can I assist you today?"))
-            .add_message(ChatMessage::user("Can you tell me a joke?"))
+            .add_message("Can you tell me a joke?")
             .thinking(Thinking::Disabled)
             .max_tokens(500)
             .stream(false)
             .build();
 
-        dbg!("Request: {:?}", serde_json::to_string(&request).unwrap());
+        let completion = send_request(&client, &request).await;
+
+        println!("Response: {:?}", completion);
+        assert!(!completion.assert_one_choice().message.content.as_ref().unwrap().is_empty());
+
+        request.add_message(completion);
 
         let completion = send_request(&client, &request).await;
 
         println!("Response: {:?}", completion);
-        assert!(!completion.choices.is_empty());
-        assert!(!completion.choices[0].message.content.as_ref().unwrap().is_empty());
-
-        request.messages.push(completion.choices[0].message.to_chat_message());
-
-        let completion = send_request(&client, &request).await;
-
-        println!("Response: {:?}", completion);
-        assert!(!completion.choices.is_empty());
-        assert!(!completion.choices[0].message.content.as_ref().unwrap().is_empty());
+        assert!(!completion.assert_one_choice().message.content.as_ref().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -687,8 +828,8 @@ mod tests {
 
         let data = fs::read_to_string("test_data/yuanjun.txt").expect("Failed to read test data");
         let mut request = Request::builder(Model::V4Flash)
-            .add_message(ChatMessage::user(data))
-            .add_message(ChatMessage::user("Please summarize the above content."))
+            .add_message(data)
+            .add_message("Please summarize the above content.")
             .thinking(Thinking::Enabled)
             .max_tokens(5000)
             .stream(true)
@@ -701,11 +842,93 @@ mod tests {
 
 
         let response_message = merge_chunks(completion_chunks);
-        request.messages.push(ChatMessage::assistant(response_message));
-        request.messages.push(ChatMessage::user("请将这段内容翻译成英文。".to_string()));
+        request.add_message(ChatMessage::assistant(response_message));
+        request.add_message("请将这段内容翻译成英文。");
 
         let completion_chunks = send_streaming_request(&client, &request).await;
         assert!(!completion_chunks.is_empty());
         println!("chunk count: {}", completion_chunks.len());
+    }
+
+    #[tokio::test]
+    async fn test_tools() {
+        let client = reqwest::Client::new();
+
+        let mut request = Request::builder(Model::V4Flash)
+            .add_message(ChatMessage::user("What is the weather like in WuHan?"))
+            .add_tool(Tool::function_builder("get_current_weather")
+                .description("Get the current weather in a given location")
+                .parameters(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "location": {
+                            "type": "string",
+                            "description": "The city and state, e.g. San Francisco, CA"
+                        }
+                    },
+                    "required": ["location"]
+                }))
+                .build())
+            .add_tool(Tool::function_builder("get_family_members")
+                .description("Get family members of a person")
+                .parameters(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "person_name": {
+                            "type": "string",
+                            "description": "The name of the person, e.g. John Doe"
+                        }
+                    },
+                    "required": ["person_name"]
+                }))
+                .build())
+            .tool_choice(ToolChoice::General(GeneralToolChoice::Auto))
+            .build();
+
+        println!("first request: \n{}", serde_json::to_string_pretty(&request).unwrap());
+        let completion = send_request(&client, &request).await;
+
+        println!("Response: {:?}", completion);
+        assert_eq!(completion.assert_one_choice().message.tool_calls.len(), 1);
+
+        request.add_message(&completion);
+        let tool_call = &completion.assert_one_choice().message.tool_calls[0];
+        match tool_call {
+            ResponseToolCall::Function { id, function } => {
+                assert_eq!(function.name, "get_current_weather");
+                let location = function.arguments.get("location").unwrap().as_str().unwrap();
+                println!("Tool call arguments: location={}", location);
+                request.add_message(ChatMessage::Tool {
+                    content: "Rain".to_string(),
+                    tool_call_id: id.clone(),
+                });
+            }
+        }
+
+        println!("Request after tool call response: \n{}", serde_json::to_string_pretty(&request).unwrap());
+        let completion = send_request(&client, &request).await;
+        println!("Response: {:?}", completion);
+
+        request.add_message(&completion);
+        request.add_message("What are the family members of John Doe?");
+        let completion = send_request(&client, &request).await;
+        println!("Response: {:?}", completion);
+        assert_eq!(completion.assert_one_choice().message.tool_calls.len(), 1);
+
+        request.add_message(&completion);
+        let tool_call = &completion.assert_one_choice().message.tool_calls[0];
+        match tool_call {
+            ResponseToolCall::Function { id, function } => {
+                assert_eq!(function.name, "get_family_members");
+                let person_name = function.arguments.get("person_name").unwrap().as_str().unwrap();
+                assert_eq!(person_name, "John Doe");
+                request.add_message(ChatMessage::Tool {
+                    content: "Jane Doe, Jack Doe".to_string(),
+                    tool_call_id: id.clone(),
+                });
+            }
+        }
+        let completion = send_request(&client, &request).await;
+        println!("Response: {:?}", completion);
     }
 }

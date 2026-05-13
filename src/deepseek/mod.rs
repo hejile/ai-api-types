@@ -1,5 +1,3 @@
-use std::fmt::Display;
-
 use serde::{Deserialize, Serialize};
 
 pub mod chat_completion;
@@ -7,7 +5,7 @@ pub mod chat_completion;
 pub const BASE_URL: &str = "https://api.deepseek.com";
 pub const BETA_BASE_URL: &str = "https://api.deepseek.com/beta";
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
 pub enum Model {
     #[serde(rename = "deepseek-v4-flash")]
     V4Flash,
