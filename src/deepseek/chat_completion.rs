@@ -525,6 +525,116 @@ impl ChatCompletion {
         assert_eq!(self.choices.len(), 1, "Expected exactly one choice, got {}", self.choices.len());
         &self.choices[0]
     }
+
+    pub fn merge_from_chunks(chunks: Vec<ChatCompletionChunk>) -> Self {
+        assert!(!chunks.is_empty(), "No chunks to merge");
+        let first_chunk = &chunks[0];
+        let id = first_chunk.id.clone();
+        let created = first_chunk.created;
+        let model = first_chunk.model;
+        let system_fingerprint = first_chunk.system_fingerprint.clone();
+
+        let mut finish_reason = None;
+        let mut content: Option<String> = None;
+        let mut reasoning_content: Option<String> = None;
+        let mut tool_calls: Vec<ToolCallDelta> = Vec::new();
+        let mut usage = None;
+        
+        for mut chunk in chunks {
+            if chunk.choices.is_empty() {
+                continue;
+            }
+            let chunk_choice = chunk.choices.remove(0);
+            if let Some(chunk_finish_reason) = chunk_choice.finish_reason {
+                finish_reason = Some(chunk_finish_reason);
+            }
+
+            let chunk_choice_delta = chunk_choice.delta;
+            if let Some(chunk_content) = chunk_choice_delta.content {
+                if let Some(ref mut content) = content {
+                    content.push_str(&chunk_content);
+                } else {
+                    content = Some(chunk_content);
+                }
+            }
+            if let Some(chunk_reasoning_content) = chunk_choice_delta.reasoning_content {
+                if let Some(ref mut reasoning) = reasoning_content {
+                    reasoning.push_str(&chunk_reasoning_content);
+                } else {
+                    reasoning_content = Some(chunk_reasoning_content);
+                }
+            }
+
+            for tool_call_delta in chunk_choice_delta.tool_calls {
+                let index = tool_call_delta.index as usize;
+                if index < tool_calls.len() {
+                    // update existing tool call
+                    let existing_tool_call = &mut tool_calls[index];
+                    if let Some(id) = &tool_call_delta.id {
+                        existing_tool_call.id = Some(id.clone());
+                    }
+                    if let Some(name) = &tool_call_delta.function.name {
+                        existing_tool_call.function.name = Some(name.clone());
+                    }
+                    if let Some(arguments) = &tool_call_delta.function.arguments {
+                        if let Some(existing_arguments) = &mut existing_tool_call.function.arguments {
+                            existing_arguments.push_str(arguments);
+                        } else {
+                            existing_tool_call.function.arguments = Some(arguments.clone());
+                        }
+                    }
+                } else {
+                    for i in tool_calls.len()..index {
+                        // fill the gap with empty tool calls if there are missing indices
+                        tool_calls.push(ToolCallDelta {
+                            id: None,
+                            function: ToolCallFunctionDelta {
+                                name: None,
+                                arguments: None,
+                            },
+                            index: i as u32,
+                        });
+                    }
+                    // add new tool call
+                    tool_calls.push(tool_call_delta);
+                }
+            }
+
+            if let Some(chunk_usage) = chunk.usage {
+                usage = Some(chunk_usage);
+            }
+        }
+
+        let tool_calls = tool_calls.into_iter().map(|delta| ToolCall::Function {
+            id: delta.id.expect("tool call id not found"),
+            function: ToolCallFunction {
+                name: delta.function.name.expect("tool call function name not found"),
+                arguments: serde_json::from_str(&delta.function.arguments.expect("tool call arguments not found")).unwrap(),
+            },
+        }).collect();
+
+        let choices = vec![Choice {
+            finish_reason: finish_reason.unwrap_or(FinishReason::Other),
+            index: 0,
+            message: ResponseMessage {
+                content,
+                reasoning_content,
+                tool_calls,
+                role: "assistant".to_string(),
+                logprobs: None,
+            },
+        }];
+
+        ChatCompletion {
+            id,
+            choices,
+            created,
+            model,
+            system_fingerprint,
+            object: "chat.completion".to_string(),
+            usage: usage.unwrap_or_default(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -548,7 +658,7 @@ pub enum FinishReason {
     Stop,
     Length,
     ContentFilter,
-    ToolCall,
+    ToolCalls,
     InsufficientSystemResource,
     #[serde(other)]
     Other,
@@ -564,7 +674,7 @@ pub struct ResponseMessage {
     pub reasoning_content: Option<String>,
     /// The tool calls generated by the model.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tool_calls: Vec<ResponseToolCall>,
+    pub tool_calls: Vec<ToolCall>,
     /// Possible values: [assistant]
     /// The role of the author of this message.
     #[serde(skip_serializing)]
@@ -576,17 +686,17 @@ pub struct ResponseMessage {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum ResponseToolCall {
+pub enum ToolCall {
     Function {
         /// The ID of the tool call.
         id: String,
         /// The function that the model called.
-        function: ResponseToolCallFunction,
+        function: ToolCallFunction,
     },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct ResponseToolCallFunction {
+pub struct ToolCallFunction {
     /// The name of the function to call.
     pub name: String,
     /// The arguments to call the function with, as generated by the model in JSON format.
@@ -652,7 +762,7 @@ pub struct LogProb {
     pub bytes: Option<Vec<u8>>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct Usage {
     /// Number of tokens in the generated completion.
     pub completion_tokens: u32,
@@ -669,7 +779,7 @@ pub struct Usage {
     pub completion_tokens_details: Option<CompletionTokensDetails>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct CompletionTokensDetails {
     /// Tokens generated by the model for reasoning.
     pub reasoning_tokens: u32,
@@ -699,8 +809,22 @@ pub struct ChunkChoice {
 pub struct ChunkChoiceDelta {
     pub content: Option<String>,
     pub reasoning_content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCallDelta>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "snake_case")]
+pub struct ToolCallDelta {
+    pub id: Option<String>,
+    pub function: ToolCallFunctionDelta,
+    pub index: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ToolCallFunctionDelta {
+    pub name: Option<String>,
+    pub arguments: Option<String>,
 }
 
 #[cfg(test)]
@@ -755,6 +879,8 @@ mod tests {
                 println!("Stream finished");
                 break;
             }
+            let json_value = serde_json::from_str::<serde_json::Value>(&event.data).unwrap();
+            println!("Received chunk data: \n{}", serde_json::to_string_pretty(&json_value).unwrap());
             let chunk: ChatCompletionChunk = serde_json::from_str(&event.data).expect("Failed to parse chunk");
             if !chunk.choices.is_empty()
                 && let Some(ref content) = chunk.choices[0].delta.content
@@ -894,7 +1020,7 @@ mod tests {
         request.add_message(&completion);
         let tool_call = &completion.assert_one_choice().message.tool_calls[0];
         match tool_call {
-            ResponseToolCall::Function { id, function } => {
+            ToolCall::Function { id, function } => {
                 assert_eq!(function.name, "get_current_weather");
                 let location = function.arguments.get("location").unwrap().as_str().unwrap();
                 println!("Tool call arguments: location={}", location);
@@ -918,7 +1044,7 @@ mod tests {
         request.add_message(&completion);
         let tool_call = &completion.assert_one_choice().message.tool_calls[0];
         match tool_call {
-            ResponseToolCall::Function { id, function } => {
+            ToolCall::Function { id, function } => {
                 assert_eq!(function.name, "get_family_members");
                 let person_name = function.arguments.get("person_name").unwrap().as_str().unwrap();
                 assert_eq!(person_name, "John Doe");
@@ -929,6 +1055,66 @@ mod tests {
             }
         }
         let completion = send_request(&client, &request).await;
+        println!("Response: {:?}", completion);
+    }
+
+    #[tokio::test]
+    async fn test_streaming_tools() {
+        let client = reqwest::Client::new();
+
+        let mut request = Request::builder(Model::V4Flash)
+            .add_message(ChatMessage::user("What is the weather like in WuHan?"))
+            .add_tool(Tool::function_builder("get_current_weather")
+                .description("Get the current weather in a given location")
+                .parameters(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "location": {
+                            "type": "string",
+                            "description": "The city and state, e.g. San Francisco, CA"
+                        }
+                    },
+                    "required": ["location"]
+                }))
+                .build())
+            .add_tool(Tool::function_builder("get_family_members")
+                .description("Get family members of a person")
+                .parameters(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "person_name": {
+                            "type": "string",
+                            "description": "The name of the person, e.g. John Doe"
+                        }
+                    },
+                    "required": ["person_name"]
+                }))
+                .build())
+            .tool_choice(ToolChoice::General(GeneralToolChoice::Auto))
+            .stream(true)
+            .build();
+
+        println!("first request: \n{}", serde_json::to_string_pretty(&request).unwrap());
+        let chunks = send_streaming_request(&client, &request).await;
+        let completion = ChatCompletion::merge_from_chunks(chunks.clone());
+
+        println!("Response: {:?}", completion);
+        request.add_message(&completion);
+
+        let tool_call = &completion.assert_one_choice().message.tool_calls[0];
+        match tool_call {
+            ToolCall::Function { id, function } => {
+                assert_eq!(function.name, "get_current_weather");
+                let location = function.arguments.get("location").unwrap().as_str().unwrap();
+                println!("Tool call arguments: location={}", location);
+                request.add_message(ChatMessage::Tool {
+                    content: "Rain".to_string(),
+                    tool_call_id: id.clone(),
+                });
+            }
+        }
+        let chunks = send_streaming_request(&client, &request).await;
+        let completion = ChatCompletion::merge_from_chunks(chunks.clone());
         println!("Response: {:?}", completion);
     }
 }
